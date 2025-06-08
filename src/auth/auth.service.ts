@@ -1,27 +1,176 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
 import { JwtPayload } from 'src/user/interfaces/jwt-payload.interface';
 import { OAuth2Result } from './interfaces/oauth2-result.interface';
 import { OAuth2Strategy } from './strategies/oauth2.strategy';
-import { UserService } from 'src/user/user.service';
 import { ConfigService } from '@nestjs/config';
 import { TokenBlacklistService } from './services/TokenBlacklist.service';
+import { AuthProviderService } from './services/AuthProvider.service';
+import { LoginDto } from './Dto/login.dto';
+import { RegisterDto } from './Dto/register.dto';
+import { ForgotPasswordDto } from './Dto/forgot-password.dto';
+import { ResetPasswordDto } from './Dto/reset-password.dto';
+
 
 @Injectable()
 export class AuthService {
+    private readonly logger = new Logger(AuthService.name);
+
     constructor(
         private readonly oAuth2Strategy: OAuth2Strategy,
         private readonly tokenBlacklistService: TokenBlacklistService,
         private readonly configService: ConfigService,
+        private readonly authProviderService: AuthProviderService,
     ) { }
 
-    // Redirige al usuario al proveedor OAuth2
+    // === Métodos de autenticación tradicional (email/password) ===
+
+    /**
+     * Login con email y contraseña
+     */
+    async login(loginDto: LoginDto) {
+        try {
+            this.logger.log(`Login attempt for user: ${loginDto.email}`);
+
+            const authResult = await this.authProviderService.login(
+                loginDto.email,
+                loginDto.password
+            );
+
+            this.logger.log(`Login successful for user: ${loginDto.email}`);
+
+            return {
+                accessToken: authResult.accessToken,
+                refreshToken: authResult.refreshToken,
+                user: authResult.user,
+                expiresAt: authResult.expiresAt,
+            };
+        } catch (error) {
+            this.logger.error(`Login failed for user: ${loginDto.email}`, error);
+            throw new UnauthorizedException('Invalid credentials');
+        }
+    }
+
+    /**
+     * Registro de usuario
+     */
+    async register(registerDto: RegisterDto) {
+        try {
+            this.logger.log(`Registration attempt for user: ${registerDto.email}`);
+
+            const authResult = await this.authProviderService.register({
+                email: registerDto.email,
+                password: registerDto.password,
+                name: registerDto.name,
+                // Agregar otros campos según necesites
+            });
+
+            this.logger.log(`Registration successful for user: ${registerDto.email}`);
+
+            return {
+                accessToken: authResult.accessToken,
+                refreshToken: authResult.refreshToken,
+                user: authResult.user,
+                expiresAt: authResult.expiresAt,
+            };
+        } catch (error) {
+            this.logger.error(`Registration failed for user: ${registerDto.email}`, error);
+            throw error; // Re-lanza la excepción del provider
+        }
+    }
+
+    /**
+     * Refresca tokens
+     */
+    async refreshToken(refreshToken: string) {
+        try {
+            // Verifica que el refresh token no esté en blacklist
+            if (await this.tokenBlacklistService.isBlacklisted(refreshToken)) {
+                throw new UnauthorizedException('Refresh token has been revoked');
+            }
+
+            this.logger.log('Attempting to refresh token');
+
+            const tokenResult = await this.authProviderService.refreshToken(refreshToken);
+
+            // Blacklist el refresh token anterior
+            await this.blacklistToken(refreshToken);
+
+            this.logger.log('Token refresh successful');
+
+            return {
+                accessToken: tokenResult.accessToken,
+                refreshToken: tokenResult.refreshToken,
+                expiresAt: tokenResult.expiresAt,
+            };
+        } catch (error) {
+            this.logger.error('Token refresh failed', error);
+            throw new UnauthorizedException('Invalid refresh token');
+        }
+    }
+
+    /**
+     * Logout - invalida tokens tanto localmente como en el proveedor
+     */
+    async logout(accessToken: string, refreshToken: string): Promise<void> {
+        try {
+            this.logger.log('Processing logout');
+
+            // Logout en el proveedor (no crítico si falla)
+            await this.authProviderService.logout(accessToken, refreshToken);
+
+            // Agregar tokens a la blacklist local
+            await Promise.all([
+                this.blacklistToken(accessToken),
+                this.blacklistToken(refreshToken),
+            ]);
+
+            this.logger.log('Logout completed successfully');
+        } catch (error) {
+            this.logger.error('Error during logout', error);
+            // Asegurar que al menos se agreguen a la blacklist local
+            try {
+                await Promise.all([
+                    this.blacklistToken(accessToken),
+                    this.blacklistToken(refreshToken),
+                ]);
+            } catch (blacklistError) {
+                this.logger.error('Failed to blacklist tokens', blacklistError);
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Solicita reset de contraseña
+     */
+    async forgotPassword(forgotPasswordDto: ForgotPasswordDto): Promise<void> {
+        await this.authProviderService.forgotPassword(forgotPasswordDto.email);
+    }
+
+    /**
+     * Resetea contraseña
+     */
+    async resetPassword(resetPasswordDto: ResetPasswordDto): Promise<void> {
+        await this.authProviderService.resetPassword(
+            resetPasswordDto.token,
+            resetPasswordDto.newPassword
+        );
+    }
+
+    // === Métodos OAuth2 ===
+
+    /**
+     * Redirige al usuario al proveedor OAuth2
+     */
     getOAuth2RedirectUrl(): string {
         const state = this.generateState();
         // Guarda el state en sesión o Redis para validación posterior
         return this.oAuth2Strategy.authorizationUrl() + `&state=${state}`;
     }
 
-    // Intercambia el código por tokens y valida
+    /**
+     * Intercambia el código OAuth2 por tokens y valida
+     */
     async exchangeCodeForTokens(code: string): Promise<OAuth2Result> {
         try {
             // Intercambia el código por tokens con el proveedor OAuth2
@@ -31,7 +180,7 @@ export class AuthService {
             const userInfo = await this.validateOAuth2Token(tokenResponse.accessToken);
 
             // Calcula la expiración del token
-            const expiresAt = userInfo.exp ? userInfo.exp * 1000 : Date.now() + (3600 * 1000); // 1 hora por defecto
+            const expiresAt = userInfo.exp ? userInfo.exp * 1000 : Date.now() + (3600 * 1000);
 
             return {
                 accessToken: tokenResponse.accessToken,
@@ -49,7 +198,41 @@ export class AuthService {
         }
     }
 
-    // Valida el token de acceso recibido del proveedor
+    // === Métodos de validación ===
+
+    /**
+     * Valida token usando el proveedor de autenticación
+     */
+    async validateToken(accessToken: string): Promise<JwtPayload> {
+        try {
+            // Verifica blacklist local primero (más rápido)
+            if (await this.tokenBlacklistService.isBlacklisted(accessToken)) {
+                throw new UnauthorizedException('Token has been revoked');
+            }
+
+            // Valida con el proveedor de autenticación
+            const validationResult = await this.authProviderService.validateToken(accessToken);
+
+            if (!validationResult.valid) {
+                throw new UnauthorizedException('Invalid token');
+            }
+
+            return {
+                sub: validationResult.user.sub,
+                email: validationResult.user.email,
+                roles: validationResult.user.roles,
+                permissions: validationResult.user.permissions,
+                exp: this.calculateExpirationFromToken(accessToken),
+            };
+        } catch (error) {
+            this.logger.error('Token validation failed', error);
+            throw new UnauthorizedException('Invalid token');
+        }
+    }
+
+    /**
+     * Valida el token OAuth2 (mantiene compatibilidad)
+     */
     async validateOAuth2Token(accessToken: string): Promise<JwtPayload> {
         // Verifica que el token no esté revocado
         if (await this.tokenBlacklistService.isBlacklisted(accessToken)) {
@@ -66,38 +249,49 @@ export class AuthService {
         return this.parseJwtPayload(accessToken);
     }
 
-    // Revoca tokens cuando el usuario cierra sesión
-    async logout(accessToken: string): Promise<void> {
-        // Agrega el token a la lista negra
-        const payload = this.parseJwtPayload(accessToken);
-        if (typeof payload.exp === 'undefined') {
-            throw new UnauthorizedException('Token expiration (exp) is missing');
-        }
+    // === Métodos utilitarios ===
 
-        await this.tokenBlacklistService.addToBlacklist(
-            accessToken,
-            payload.exp * 1000,
-        );
-
-        // Opcional: Llama al endpoint de logout del proveedor
-        await this.revokeProviderToken(accessToken);
-    }
-
-    // Obtiene la URL de redirección después del login
+    /**
+     * Obtiene la URL de redirección después del login
+     */
     getRedirectUrl(): string {
         return this.configService.get<string>('OAUTH2_REDIRECT_SUCCESS_URL', '/dashboard');
     }
 
-    // Genera un estado único para prevenir CSRF
+    /**
+     * Agrega un token a la blacklist con su tiempo de expiración
+     */
+    private async blacklistToken(token: string): Promise<void> {
+        try {
+            const payload = this.parseJwtPayload(token);
+            const expiresAt = payload.exp ? payload.exp * 1000 : Date.now() + (3600 * 1000);
+
+            await this.tokenBlacklistService.addToBlacklist(token, expiresAt);
+        } catch (error) {
+            this.logger.error('Failed to blacklist token', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Calcula la expiración de un token JWT
+     */
+    private calculateExpirationFromToken(token: string): number {
+        try {
+            const payload = this.parseJwtPayload(token);
+            return payload.exp || Math.floor(Date.now() / 1000) + 3600; // 1 hora por defecto
+        } catch (error) {
+            return Math.floor(Date.now() / 1000) + 3600; // 1 hora por defecto
+        }
+    }
+
+    // === Métodos privados (OAuth2 - mantiene compatibilidad) ===
+
     private generateState(): string {
         return Math.random().toString(36).substring(2);
     }
 
-    // Intercambia el código con el proveedor OAuth2
     private async exchangeCodeWithProvider(code: string): Promise<{ accessToken: string; refreshToken?: string }> {
-        // Implementa la lógica para intercambiar el código por tokens
-        // Ejemplo: POST a /token con authorization_code grant
-
         const clientId = this.configService.get<string>('OAUTH2_CLIENT_ID');
         const clientSecret = this.configService.get<string>('OAUTH2_CLIENT_SECRET');
         const redirectUri = this.configService.get<string>('OAUTH2_REDIRECT_URI');
@@ -131,14 +325,12 @@ export class AuthService {
         };
     }
 
-    // Valida el token con el proveedor (ejemplo con introspección)
     private async introspectToken(token: string): Promise<boolean> {
         // Implementa la lógica para validar el token con el proveedor
         // Ejemplo: Llamada a /introspect con client_id y client_secret
         return true; // Placeholder
     }
 
-    // Parsea el JWT (si el token es JWT)
     private parseJwtPayload(token: string): JwtPayload {
         try {
             // Decodifica el JWT sin verificar (verifica en introspectToken)
@@ -149,7 +341,6 @@ export class AuthService {
         }
     }
 
-    // Revoca el token en el proveedor (opcional)
     private async revokeProviderToken(token: string): Promise<void> {
         // Llama al endpoint /revoke del proveedor
         const clientId = this.configService.get<string>('OAUTH2_CLIENT_ID');

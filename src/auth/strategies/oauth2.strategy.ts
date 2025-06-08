@@ -7,12 +7,12 @@ import { ConfigService } from '@nestjs/config';
 export class OAuth2Strategy extends PassportStrategy(Strategy, 'oauth2') {
     constructor(private readonly configService: ConfigService) {
         super({
-            authorizationURL: configService.get('oauth2.authorizationUrl'),
-            tokenURL: configService.get('oauth2.tokenUrl'),
-            clientID: configService.get('oauth2.clientId'),
-            clientSecret: configService.get('oauth2.clientSecret'),
-            callbackURL: configService.get('oauth2.redirectUrl'),
-            scope: configService.get('oauth2.scope'),
+            authorizationURL: configService.get<string>('oauth2.authorizationUrl', ''),
+            tokenURL: configService.get<string>('oauth2.tokenUrl', ''),
+            clientID: configService.get<string>('oauth2.clientId', ''),
+            clientSecret: configService.get<string>('oauth2.clientSecret', ''),
+            callbackURL: configService.get<string>('oauth2.redirectUrl', ''),
+            scope: configService.get<string>('oauth2.scope', ''),
         });
     }
 

@@ -1,10 +1,19 @@
 import { Controller, Get, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
+import { ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { AuthHealthService } from './services/Health.service';
+import { CircuitBreakerService } from './services/circuit-breaker.service';
+import { CircuitBreakerState } from './Dto/circuit-breaker.dto';
+import { HealthStatus } from './Dto/health-status.dto';
 
 @Controller('auth')
 export class AuthController {
-    constructor(private readonly authService: AuthService) { }
+    constructor(
+        private readonly authService: AuthService,
+        private readonly authHealthService: AuthHealthService,
+        private readonly circuitBreakerService: CircuitBreakerService,
+    ) { }
 
     @Get('oauth2/redirect')
     async oauth2Redirect(@Res() res: Response) {
@@ -41,9 +50,10 @@ export class AuthController {
     async logout(@Req() req: Request, @Res() res: Response) {
         try {
             const accessToken = req.session.accessToken;
+            const refreshToken = req.session.refreshToken;
 
-            if (accessToken) {
-                await this.authService.logout(accessToken);
+            if (accessToken && refreshToken) {
+                await this.authService.logout(accessToken, refreshToken);
             }
 
             // Destruye la sesión
@@ -67,5 +77,25 @@ export class AuthController {
         }
 
         res.json(req.session.user);
+    }
+
+    @Get()
+    @ApiOperation({ summary: 'Get overall health status' })
+    @ApiResponse({ status: 200, description: 'Health status retrieved successfully' })
+    async getHealth(): Promise<HealthStatus> {
+        return await this.authHealthService.performHealthCheck();
+    }
+    
+    @Get('detailed')
+    @ApiOperation({ summary: 'Get detailed health information' })
+    @ApiResponse({ status: 200, description: 'Detailed health information retrieved successfully' })
+    async getDetailedHealth(): Promise<HealthStatus & { circuitBreakers: Record<string, CircuitBreakerState> }> {
+        const healthStatus = await this.authHealthService.performHealthCheck();
+        const circuitStates = this.circuitBreakerService.getCircuitStates();
+
+        return {
+            ...healthStatus,
+            circuitBreakers: circuitStates,
+        };
     }
 }
