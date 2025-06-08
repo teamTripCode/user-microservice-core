@@ -1,0 +1,87 @@
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "mongodb"
+    url      = env("DATABASE_URL")
+}
+
+model User {
+    id        String   @id @default(auto()) @map("_id") @db.ObjectId
+    email     String   @unique
+    firstName String
+    lastName  String
+    phone     String?
+    isActive  Boolean  @default(true)
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    // Relaciones
+    kycKyb  KycKyb?
+    gcpKeys GcpKey[]
+
+    @@map("users")
+}
+
+model KycKyb {
+    id               String    @id @default(auto()) @map("_id") @db.ObjectId
+    userId           String    @unique @db.ObjectId
+    type             KycType
+    status           KycStatus @default(PENDING)
+    documentType     String?
+    documentNumber   String?
+    documentUrl      String?
+    addressProof     String?
+    businessName     String?
+    businessType     String?
+    businessAddress  String?
+    taxId            String?
+    verificationDate DateTime?
+    rejectionReason  String?
+    notes            String?
+    createdAt        DateTime  @default(now())
+    updatedAt        DateTime  @updatedAt
+
+    // Relación
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@map("kyc_kyb")
+}
+
+model GcpKey {
+    id             String     @id @default(auto()) @map("_id") @db.ObjectId
+    userId         String     @db.ObjectId
+    keyName        String
+    keyType        GcpKeyType
+    keyData        String // JSON string con la información de la clave
+    serviceAccount String?
+    projectId      String
+    isActive       Boolean    @default(true)
+    expiresAt      DateTime?
+    createdAt      DateTime   @default(now())
+    updatedAt      DateTime   @updatedAt
+
+    // Relación
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@map("gcp_keys")
+}
+
+enum KycType {
+    KYC
+    KYB
+}
+
+enum KycStatus {
+    PENDING
+    APPROVED
+    REJECTED
+    EXPIRED
+}
+
+enum GcpKeyType {
+    SERVICE_ACCOUNT
+    API_KEY
+    OAUTH_CLIENT
+}
